@@ -1,0 +1,16 @@
+Header
+Service
+In-Network Coinsurance
+In-Network After Deductible Flag
+In-Network Copay
+Out-Of-Network Coinsurance
+Out-Of-Network After Deductible Flag
+Out-Of-Network Copay
+Individual In-Network
+Family In-Network
+Individual Out-Of-Network
+Family Out-Of-Network
+Limit Type
+Limit Period
+Pre-Authorization Required
+Confidence Score
