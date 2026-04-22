@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-
+Output/
+OutputExcel/
 # Distribution / packaging
 .Python
 build/
