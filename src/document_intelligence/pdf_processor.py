@@ -17,6 +17,9 @@ as it provides:
 import logging
 import os
 import re
+import sys
+import warnings
+warnings.filterwarnings("ignore", category=Warning, module="urllib3")
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -117,6 +120,8 @@ class PDFProcessor:
             )
             if not verify_ssl:
                 logger.warning("SSL verification disabled for Azure Document Intelligence")
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             logger.info("Azure Document Intelligence client initialized successfully")
             return True
         except ImportError:
@@ -174,6 +179,8 @@ class PDFProcessor:
                     return result.to_dict()
             except Exception as e:
                 logger.warning(f"Azure extraction failed: {e}. Trying fallback...")
+                sys.exit(e)
+                
         
         # Try pdfplumber (good for tables)
         if self.pdfplumber_available:
@@ -242,79 +249,164 @@ class PDFProcessor:
     def _parse_azure_table(self, table, table_idx: int) -> Dict[str, Any]:
         """
         Parse an Azure Document Intelligence table into structured format.
-        
-        FIXED: Properly handles merged cells by propagating content across all spanned columns.
-        For example, if a cell with "80%" spans both In-Network and Out-of-Network columns,
-        the value will now appear in both columns instead of just the first one.
+
+        Handles merged cells in two ways:
+        1. Span-reported merges: Azure DI explicitly sets column_span > 1.
+        2. Geometry-detected merges (silent failure): Azure DI reports column_span=1
+           but the cell bounding polygon physically extends across the next column(s).
+           Wrapped in try/except so any geometry failure falls back gracefully to
+           span-only propagation and never crashes the Azure extraction.
         """
         cells = []
         rows_dict: Dict[int, Dict[int, str]] = {}
-        
-        row_count = getattr(table, "row_count", 0)
-        column_count = getattr(table, "column_count", 0)
-        
-        # Track which cells have been filled by merged cells
-        merged_cell_map: Dict[Tuple[int, int], str] = {}
-        
+
+        row_count    = int(getattr(table, "row_count", 0) or 0)
+        column_count = int(getattr(table, "column_count", 0) or 0)
+
+        # Pass 1 - collect raw cell data including bounding-polygon x-coords
+        cell_records = []
         for cell in table.cells:
-            row_idx = cell.row_index
-            col_idx = cell.column_index
-            content = cell.content.strip() if cell.content else ""
-            row_span = getattr(cell, "row_span", 1)
-            col_span = getattr(cell, "column_span", 1)
-            
-            # Store cell metadata
-            cells.append({
-                "row_index": row_idx,
-                "column_index": col_idx,
-                "content": content,
-                "row_span": row_span,
-                "column_span": col_span,
-                "kind": getattr(cell, "kind", "content"),  # "columnHeader", "rowHeader", "content"
+            row_idx  = cell.row_index
+            col_idx  = cell.column_index
+            content  = cell.content.strip() if cell.content else ""
+            row_span = int(getattr(cell, "row_span", 1) or 1)
+            col_span = int(getattr(cell, "column_span", 1) or 1)
+
+            poly_x = []
+            try:
+                if hasattr(cell, "bounding_regions") and cell.bounding_regions:
+                    for region in cell.bounding_regions:
+                        if hasattr(region, "polygon") and region.polygon:
+                            poly = region.polygon
+                            if poly and isinstance(poly[0], (int, float)):
+                                poly_x = [poly[i] for i in range(0, len(poly), 2)]
+                            else:
+                                poly_x = [p.x for p in poly]
+            except Exception:
+                poly_x = []
+
+            # Filter out None and non-numeric values before min/max
+            poly_x = [v for v in poly_x if v is not None and isinstance(v, (int, float))]
+            x_min = min(poly_x) if poly_x else None
+            x_max = max(poly_x) if poly_x else None
+
+            cell_records.append({
+                "row_idx": row_idx, "col_idx": col_idx,
+                "content": content, "row_span": row_span, "col_span": col_span,
+                "x_min": x_min, "x_max": x_max,
             })
-            
-            # Build row-based structure with merged cell propagation
-            if row_idx not in rows_dict:
-                rows_dict[row_idx] = {}
-            
-            # FIXED: Propagate merged cell content across all spanned columns and rows
-            for r_offset in range(row_span):
-                for c_offset in range(col_span):
-                    target_row = row_idx + r_offset
-                    target_col = col_idx + c_offset
-                    
-                    # Only propagate within table bounds
-                    if target_row < row_count and target_col < column_count:
-                        if target_row not in rows_dict:
-                            rows_dict[target_row] = {}
-                        
-                        # Fill the cell with content (propagate merged value)
-                        rows_dict[target_row][target_col] = content
-                        merged_cell_map[(target_row, target_col)] = content
-                        
-                        # Log merged cell propagation for debugging
-                        if col_span > 1 or row_span > 1:
-                            if r_offset == 0 and c_offset == 0:
-                                logger.debug(
-                                    f"Table {table_idx}: Merged cell at ({row_idx},{col_idx}) "
-                                    f"with span ({row_span}x{col_span}) - propagating '{content}'"
-                                )
-        
-        # Convert to list of lists
+            cells.append({
+                "row_index": row_idx, "column_index": col_idx,
+                "content": content, "row_span": row_span, "column_span": col_span,
+                "kind": getattr(cell, "kind", "content"),
+            })
+
+        # Pass 2 - geometry-aware span detection
+        # Wrapped in try/except: any failure falls back to span-only propagation
+        geo_merges_detected = 0
+        try:
+            # Build per-column x-boundary map using only single-span cells
+            # where BOTH x_min and x_max are valid numbers
+            col_x_mins = {}
+            col_x_maxs = {}
+            for cr in cell_records:
+                if (cr["col_span"] == 1
+                        and cr["x_min"] is not None
+                        and cr["x_max"] is not None
+                        and isinstance(cr["x_min"], (int, float))
+                        and isinstance(cr["x_max"], (int, float))):
+                    c = cr["col_idx"]
+                    col_x_mins.setdefault(c, []).append(float(cr["x_min"]))
+                    col_x_maxs.setdefault(c, []).append(float(cr["x_max"]))
+
+            # Median x-start / x-end per column
+            col_boundaries = {}
+            for c in col_x_mins:
+                mins_s = sorted(col_x_mins[c])
+                maxs_s = sorted(col_x_maxs[c])
+                col_boundaries[c] = (mins_s[len(mins_s) // 2], maxs_s[len(maxs_s) // 2])
+
+            # Detect and propagate across all spanned rows/columns
+            for cr in cell_records:
+                col_span = cr["col_span"]
+                effective_col_span = col_span
+
+                if (cr["content"]
+                        and cr["x_max"] is not None
+                        and isinstance(cr["x_max"], (int, float))
+                        and col_span == 1):
+                    for next_col in range(cr["col_idx"] + 1, column_count):
+                        if next_col in col_boundaries:
+                            next_mid = (col_boundaries[next_col][0] + col_boundaries[next_col][1]) / 2.0
+                            if float(cr["x_max"]) > next_mid:
+                                effective_col_span = next_col - cr["col_idx"] + 1
+                            else:
+                                break
+
+                if effective_col_span > col_span:
+                    geo_merges_detected += 1
+                    logger.debug(
+                        "Table %d: geometry-detected merge at (%d,%d) "
+                        "col_span=%d -> effective_col_span=%d value='%s'",
+                        table_idx, cr["row_idx"], cr["col_idx"],
+                        col_span, effective_col_span, cr["content"],
+                    )
+
+                for r_offset in range(cr["row_span"]):
+                    for c_offset in range(effective_col_span):
+                        tr = cr["row_idx"] + r_offset
+                        tc = cr["col_idx"] + c_offset
+                        if tr < row_count and tc < column_count:
+                            rows_dict.setdefault(tr, {})[tc] = cr["content"]
+
+            if geo_merges_detected:
+                logger.info(
+                    "Table %d: %d geometry-based merged cell(s) detected.",
+                    table_idx, geo_merges_detected,
+                )
+
+        except Exception as geo_err:
+            # Geometry detection failed - fall back to span-only propagation
+            logger.warning(
+                "Table %d: geometry merge detection failed (%s). "
+                "Falling back to span-only propagation.",
+                table_idx, geo_err,
+            )
+            rows_dict.clear()
+            for cr in cell_records:
+                for r_offset in range(cr["row_span"]):
+                    for c_offset in range(cr["col_span"]):
+                        tr = cr["row_idx"] + r_offset
+                        tc = cr["col_idx"] + c_offset
+                        if tr < row_count and tc < column_count:
+                            rows_dict.setdefault(tr, {})[tc] = cr["content"]
+
+        # Convert rows_dict to ordered list-of-lists
         rows = []
         for row_idx in range(row_count):
-            row = []
-            for col_idx in range(column_count):
-                row.append(rows_dict.get(row_idx, {}).get(col_idx, ""))
+            row = [rows_dict.get(row_idx, {}).get(col_idx, "") for col_idx in range(column_count)]
             rows.append(row)
-        
-        # Detect header row
+
+        # ------------------------------------------------------------------
+        # Content-based implicit-merge propagation
+        # ------------------------------------------------------------------
+        # When geometry/span detection cannot fire (e.g. Azure DI returns None
+        # polygons), rows where the In-Network column has a benefit value but
+        # the Non-Network column is empty indicate an implicit merged cell in
+        # the original PDF.  Detect the In-Network and Non-Network column
+        # indices from the header rows and copy the value across.
+        rows = self._propagate_implicit_merged_cells(rows)
+
         header_row_idx = -1
         for cell in cells:
             if cell.get("kind") == "columnHeader":
                 header_row_idx = cell["row_index"]
                 break
-        
+
+        total_merged = len([
+            c for c in cells if c.get("column_span", 1) > 1 or c.get("row_span", 1) > 1
+        ])
+
         return {
             "table_index": table_idx,
             "rows": rows,
@@ -322,8 +414,78 @@ class PDFProcessor:
             "row_count": row_count,
             "column_count": column_count,
             "header_row_index": header_row_idx,
-            "merged_cells_count": len([c for c in cells if c.get("column_span", 1) > 1 or c.get("row_span", 1) > 1]),
+            "merged_cells_count": total_merged + geo_merges_detected,
         }
+    def _propagate_implicit_merged_cells(self, rows: list) -> list:
+        """
+        Content-based implicit merged-cell propagation.
+
+        When Azure DI returns None polygon coordinates the geometry pass cannot
+        detect merged cells.  This method handles that case purely from table
+        content:
+
+        1.  Scan the first few rows for column headers containing
+            'in-network' / 'in network' and 'non-network' / 'out-of-network'
+            / 'out of network' to identify the two target column indices.
+        2.  For every data row: if the In-Network column contains a benefit
+            value (%, $, or known coverage phrase) AND the Non-Network column
+            is blank, copy the In-Network value into the Non-Network column.
+
+        This mirrors exactly what a human reader understands when a single cell
+        visually spans both columns in the PDF.
+        """
+        if not rows:
+            return rows
+
+        import re
+
+        # Benefit-value pattern: %, $, or common coverage phrases
+        BENEFIT_RE = re.compile(
+            r"\d+\s*%|\$[\d,]+|not covered|no coverage|deductible waived|"
+            r"100%;|copay|coinsurance|as any",
+            re.IGNORECASE,
+        )
+
+        # Patterns that identify In-Network and Non-/Out-of-Network headers
+        IN_NET_RE  = re.compile(r"\bin[-\s]?network\b", re.IGNORECASE)
+        OUT_NET_RE = re.compile(
+            r"\b(non[-\s]?network|out[-\s]?of[-\s]?network)\b", re.IGNORECASE
+        )
+
+        # Scan up to the first 4 rows for header columns
+        in_col  = None
+        out_col = None
+        for row in rows[:4]:
+            for ci, cell in enumerate(row):
+                if cell and IN_NET_RE.search(str(cell)) and not OUT_NET_RE.search(str(cell)):
+                    in_col = ci
+                if cell and OUT_NET_RE.search(str(cell)):
+                    out_col = ci
+            if in_col is not None and out_col is not None:
+                break
+
+        if in_col is None or out_col is None:
+            return rows   # Cannot determine columns; return unchanged
+
+        propagated = 0
+        result = []
+        for row in rows:
+            row = list(row)  # make mutable copy
+            if (in_col < len(row) and out_col < len(row)):
+                in_val  = str(row[in_col]).strip()
+                out_val = str(row[out_col]).strip()
+                if in_val and not out_val and BENEFIT_RE.search(in_val):
+                    row[out_col] = in_val
+                    propagated += 1
+            result.append(row)
+
+        if propagated:
+            logger.info(
+                "Implicit merged-cell propagation: copied In-Network value to "
+                "Non-Network column for %d row(s) (col %d -> col %d).",
+                propagated, in_col, out_col,
+            )
+        return result
 
     def _extract_with_pdfplumber(self, pdf_path: str) -> ExtractionResult:
         """Extract content using pdfplumber (good for table detection)."""
