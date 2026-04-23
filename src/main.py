@@ -176,6 +176,7 @@ def main() -> int:
         # Initialize orchestrator
         orchestrator = Orchestrator(
             output_dir=str(output_dir),
+            text_output_dir=str(project_root / "Output"),
             confidence_threshold=args.confidence_threshold,
             enable_validation=not args.skip_validation,
         )
@@ -211,6 +212,7 @@ def main() -> int:
         # Initialize orchestrator
         orchestrator = Orchestrator(
             output_dir=str(output_dir),
+            text_output_dir=str(project_root / "Output"),
             confidence_threshold=args.confidence_threshold,
             enable_validation=not args.skip_validation,
         )

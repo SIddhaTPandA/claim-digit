@@ -23,7 +23,19 @@ SYSTEM_CONTEXT = (
     "OUTPUT SCHEMA -- 16 columns per row\n"
     "===================================\n"
     "Header                              : Exact parent section heading from the document.\n"
-    "Service                             : Exact service name from the document.\n"
+    "Service                             : The SHORT subheader label only -- exactly as it\n"
+    "                                      appears at the START of the benefit row, before any\n"
+    "                                      description, narrative, or explanatory text.\n"
+    "                                      Strip everything after the benefit rate value or any\n"
+    "                                      explanatory sentence that follows the service label.\n"
+    "                                      CORRECT: 'Room and Board'\n"
+    "                                      WRONG  : 'Room and Board Precertification required Includes\n"
+    "                                               the medical services and supplies furnished by...'\n"
+    "                                      CORRECT: 'Emergency Room Treatment including related services'\n"
+    "                                      CORRECT: 'Non-Emergency Services at Emergency Room'\n"
+    "                                      CORRECT: 'Outpatient / Ambulatory Surgery - Facility'\n"
+    "                                      If the STRUCTURED TABLES section is present, use the\n"
+    "                                      first cell of the row as the Service name verbatim.\n"
     "In-Network Coinsurance              : VERBATIM benefit text for in-network\n"
     "                                      (e.g. '80% after Deductible',\n"
     "                                      '100%; Deductible waived', 'NOT COVERED').\n"
@@ -101,7 +113,19 @@ SYSTEM_CONTEXT = (
     "RULE 7 -- PRE-AUTHORIZATION\n"
     "  'Precertification required' anywhere near the service -> 'Yes'. Else 'No'.\n"
     "\n"
-    "GENERAL RULES\n"
+    "RULE 8 -- MERGED CELLS (same value applies to BOTH In-Network and Out-of-Network)\n"
+    "  The document appended at the end contains a STRUCTURED TABLES section where\n"
+    "  every merged/spanning cell has already been duplicated into each column it spans.\n"
+    "  When you see the same value in BOTH the In-Network and Non-Network columns of a\n"
+    "  structured table row, populate BOTH In-Network Coinsurance AND Out-Of-Network\n"
+    "  Coinsurance with that verbatim value.\n"
+    "  Example: | Emergency Room Treatment | 80% after In-Network Deductible | 80% after In-Network Deductible |\n"
+    "    -> In-Network Coinsurance    = '80% after In-Network Deductible'\n"
+    "    -> Out-Of-Network Coinsurance = '80% after In-Network Deductible'\n"
+    "  NEVER leave Out-Of-Network blank just because the raw text showed the value only once.\n"
+    "  Always cross-check the STRUCTURED TABLES section for the correct column values.\n"
+    "\n"
+        "GENERAL RULES\n"
     "  * Extract EVERY service -- tables AND paragraphs. Do not skip any.\n"
     "  * Never invent, calculate, or infer values. If not stated, leave blank.\n"
     "  * 'Non-Network' and 'Out-of-Network' are synonymous.\n"
@@ -213,7 +237,18 @@ FEW_SHOT_EXAMPLES = (
     '"Individual In-Network":"","Family In-Network":"","Individual Out-Of-Network":"","Family Out-Of-Network":"",'
     '"Limit Type":"","Limit Period":"","Pre-Authorization Required":"No","Confidence Score":"0.99"}\n'
     "\n"
-    "Doc: Teladoc Services -- General Medicine  100%; Deductible waived\n"
+    "\n"
+    "Doc (merged-cell table): | Emergency Room Treatment | 80% after In-Network Deductible | 80% after In-Network Deductible |\n"
+    "  (The value appears in BOTH the In-Network and Non-Network columns because the PDF\n"
+    "   used a merged cell spanning both columns -- treat each column independently.)\n"
+    'Output: {"Header":"Emergency and Urgent Care Services","Service":"Emergency Room Treatment",'
+    '"In-Network Coinsurance":"80% after In-Network Deductible","In-Network After Deductible Flag":"Yes",'
+    '"In-Network Copay":"","Out-Of-Network Coinsurance":"80% after In-Network Deductible",'
+    '"Out-Of-Network After Deductible Flag":"Yes","Out-Of-Network Copay":"",'
+    '"Individual In-Network":"","Family In-Network":"","Individual Out-Of-Network":"","Family Out-Of-Network":"",'
+    '"Limit Type":"","Limit Period":"","Pre-Authorization Required":"No","Confidence Score":"0.99"}\n'
+    "\n"
+        "Doc: Teladoc Services -- General Medicine  100%; Deductible waived\n"
     'Output: {"Header":"Teladoc Services","Service":"General Medicine",'
     '"In-Network Coinsurance":"100%; Deductible waived","In-Network After Deductible Flag":"No",'
     '"In-Network Copay":"","Out-Of-Network Coinsurance":"","Out-Of-Network After Deductible Flag":"","Out-Of-Network Copay":"",'

@@ -61,18 +61,32 @@ def _parse_json_from_output(raw: str) -> List[Dict[str, Any]]:
     return []
 
 
+def _normalise(s: str) -> str:
+    """Collapse all whitespace variants so 'Out-of- Pocket' == 'Out-of-Pocket'."""
+    import re
+    return re.sub(r'\s+', ' ', str(s)).strip().lower()
+
+def _richness(rec: Dict[str, Any]) -> int:
+    """Count non-empty fields — used to prefer the more populated record."""
+    return sum(1 for v in rec.values() if str(v).strip())
+
+
 def _deduplicate(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: set = set()
-    out: List[Dict[str, Any]] = []
+    """
+    Deduplicate by (Header, Service) with whitespace-normalised keys.
+    When the same key is seen more than once keep the RICHER record
+    (most populated fields), so structured-table rows with both In-Network
+    and Out-of-Network values beat raw-OCR rows that only have one column.
+    """
+    best: Dict[tuple, Dict[str, Any]] = {}
     for rec in records:
         key = (
-            str(rec.get('Header',  '')).strip().lower(),
-            str(rec.get('Service', '')).strip().lower(),
+            _normalise(rec.get('Header',  '')),
+            _normalise(rec.get('Service', '')),
         )
-        if key not in seen:
-            seen.add(key)
-            out.append(rec)
-    return out
+        if key not in best or _richness(rec) > _richness(best[key]):
+            best[key] = rec
+    return list(best.values())
 
 
 def _build_client() -> AzureOpenAI:
