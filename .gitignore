@@ -2,6 +2,7 @@
 __pycache__/
 Output/
 OutputExcel/
+Plans/
 # Distribution / packaging
 .Python
 build/
