@@ -173,15 +173,21 @@ class PDFProcessor:
                 if result and result.tables:
                     logger.info(
                         f"Azure DI extracted {len(result.tables)} tables, "
-                        f"{result.page_count} pages"
+                        f"{result.page_count} pages "
                         "------------------AZURE----------------"
                     )
                     return result.to_dict()
+                if result and result.text:
+                    # Azure succeeded but found no tables (text-heavy document).
+                    # Return Azure text directly — better OCR quality than pdfplumber.
+                    logger.info(
+                        f"Azure DI: no tables detected, returning text-only result "
+                        f"({result.page_count} pages) ------------------AZURE TEXT-ONLY----------------"
+                    )
+                    return result.to_dict()
             except Exception as e:
-                logger.warning(f"Azure extraction failed: {e}. Trying fallback...")
-                sys.exit(e)
-                
-        
+                logger.warning(f"Azure extraction failed: {e}. Trying pdfplumber fallback...")
+
         # Try pdfplumber (good for tables)
         if self.pdfplumber_available:
             try:

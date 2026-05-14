@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.document_intelligence.pdf_processor import PDFProcessor
+from src.document_intelligence.document_classifier import DocumentClassifier
+from src.document_intelligence.table_preprocessor import TablePreprocessor
 from src.agents.benefits_extraction_crew import run_benefits_extraction_crew
 
 logger = logging.getLogger(__name__)
@@ -66,7 +68,7 @@ class Orchestrator:
                 # extract them as duplicate service entries.
                 non_empty = [str(c).strip() for c in row if str(c).strip()]
                 if len(non_empty) >= 2 and len(set(non_empty)) == 1:
-                    continue  # all non-empty cells identical → section-header row
+                    continue  # all non-empty cells identical -> section-header row
                 lines.append("| " + " | ".join(str(c) for c in row) + " |")
             lines.append("")
         lines.append("--- END STRUCTURED TABLES ---")
@@ -84,20 +86,36 @@ class Orchestrator:
                 return ProcessingResult(source_file=str(pdf_path), output_file=None, success=False, records_extracted=0, overall_confidence=0.0, requires_review=True, error_message="Failed to extract content from PDF")
             text_content = pdf_content.get("text", "")
             tables = pdf_content.get("tables", [])
+
+            # ── Layer 1: Classify document ────────────────────────────────────
+            doc_profile = DocumentClassifier.classify(text_content, tables)
+            logger.info(
+                "Document profile -- type=%s perspective=%s network=%s "
+                "wide_tables=%s combined_ded=%s cross_refs=%s sbc_limits=%s "
+                "confidence=%.2f",
+                doc_profile.doc_type, doc_profile.value_perspective,
+                doc_profile.network_model,
+                doc_profile.has_wide_tables,
+                doc_profile.has_combined_deductible_cells,
+                doc_profile.has_cross_references,
+                doc_profile.has_sbc_limitations_column,
+                doc_profile.confidence,
+            )
+            # ─────────────────────────────────────────────────────────────────
+
             if tables:
+                # ── Layer 2: Pre-process tables ───────────────────────────────
+                tables = TablePreprocessor.preprocess(tables, doc_profile)
+                # ─────────────────────────────────────────────────────────────
+
                 tables_text = self._tables_to_text(tables)
                 logger.info(
                     "Prepending %d structured table(s) to LLM input "
-                    "(merged cells already expanded by PDFProcessor). "
-                    "Tables placed at TOP so LLM sees correct merged-cell values "
-                    "before raw OCR text, ensuring deduplication keeps table values.",
-                    len(tables),
+                    "(merged cells expanded, pre-processed for doc type %s). "
+                    "Tables placed at TOP so LLM sees correct values before raw OCR text.",
+                    len(tables), doc_profile.doc_type,
                 )
                 # PREPEND tables so they appear in the FIRST chunk sent to the LLM.
-                # Previously tables were appended to the end, so raw OCR chunks
-                # (where merged cells show only one column value) were processed
-                # first and won deduplication. Prepending guarantees the correct
-                # per-column values from the structured table are seen first.
                 text_content = tables_text + text_content
             txt_path = self.text_output_dir / f"{source_name}_extracted.txt"
             txt_path.write_text(text_content, encoding="utf-8")
@@ -127,7 +145,11 @@ class Orchestrator:
             logger.info("Step 2: Running LLM powered benefits extraction ...")
             output_name = output_filename or f"{source_name}.xlsx"
             output_path = self.output_dir / output_name
-            records = run_benefits_extraction_crew(text_content=text_content, output_excel_path=str(output_path))
+            records = run_benefits_extraction_crew(
+                text_content=text_content,
+                output_excel_path=str(output_path),
+                doc_profile=doc_profile,
+            )
             records_extracted = len(records)
             if records_extracted == 0:
                 return ProcessingResult(source_file=str(pdf_path), output_file=None, success=False, records_extracted=0, overall_confidence=0.0, requires_review=True, error_message="Crew extracted 0 records from document")

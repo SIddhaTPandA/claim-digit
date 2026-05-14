@@ -129,8 +129,9 @@ def print_results_summary(results: List[ProcessingResult]) -> None:
         print("SUCCESSFUL EXTRACTIONS:")
         for r in successful:
             review_flag = " [NEEDS REVIEW]" if r.requires_review else ""
+            out_name = Path(r.output_file).name if r.output_file else "(extract-only)"
             print(
-                f"  {Path(r.source_file).name} -> {Path(r.output_file).name} "
+                f"  {Path(r.source_file).name} -> {out_name} "
                 f"({r.records_extracted} records, {r.overall_confidence:.0%}){review_flag}"
             )
     

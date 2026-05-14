@@ -10,7 +10,11 @@ warnings.filterwarnings('ignore', message='.*PydanticSerializationUnexpectedValu
 from openai import AzureOpenAI
 
 from src.config.backstory import AGENT_BACKSTORY
-from src.config.task import build_task_description
+from src.config.task import (
+    build_task_description,
+    build_task_description_plan_pays,
+    build_task_description_sbc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,15 +103,30 @@ def _build_client() -> AzureOpenAI:
     return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version=api_version)
 
 
-def _call_gpt(client: AzureOpenAI, chunk: str) -> str:
+def _select_prompt(chunk: str, doc_profile=None) -> str:
+    """Return the appropriate task prompt based on the document profile."""
+    if doc_profile is None:
+        return build_task_description(chunk)
+    if getattr(doc_profile, 'doc_type', None) == 'SBC':
+        return build_task_description_sbc(chunk)
+    # Route plan-pays perspective (and mixed where plan-pays dominates) to the
+    # plan-pays prompt -- 'mixed' arises when the body uses plan-pays phrasing
+    # but pharmacy tiers use member-pays copay amounts (e.g. Cigna).
+    if getattr(doc_profile, 'value_perspective', None) in ('plan_pays', 'mixed'):
+        return build_task_description_plan_pays(chunk)
+    return build_task_description(chunk)
+
+
+def _call_gpt(client: AzureOpenAI, chunk: str, doc_profile=None) -> str:
     deployment = os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4o')
     temp       = float(os.getenv('AZURE_OPENAI_TEMPERATURE', '0.1'))
     timeout    = float(os.getenv('AZURE_OPENAI_TIMEOUT', '800'))
+    task_prompt = _select_prompt(chunk, doc_profile)
     response = client.chat.completions.create(
         model=deployment,
         messages=[
             {'role': 'system', 'content': AGENT_BACKSTORY},
-            {'role': 'user',   'content': build_task_description(chunk)},
+            {'role': 'user',   'content': task_prompt},
         ],
         temperature=temp,
         timeout=timeout,
@@ -115,7 +134,11 @@ def _call_gpt(client: AzureOpenAI, chunk: str) -> str:
     return response.choices[0].message.content or ''
 
 
-def run_benefits_extraction_crew(text_content: str, output_excel_path: str) -> List[Dict[str, Any]]:
+def run_benefits_extraction_crew(
+    text_content: str,
+    output_excel_path: str,
+    doc_profile=None,
+) -> List[Dict[str, Any]]:
     from src.generators.excel_generator import ExcelGenerator
     chunk_size = int(os.getenv('CHUNK_SIZE',    '25000'))
     overlap    = int(os.getenv('CHUNK_OVERLAP', '500'))
@@ -126,7 +149,7 @@ def run_benefits_extraction_crew(text_content: str, output_excel_path: str) -> L
     for i, chunk in enumerate(chunks, 1):
         logger.info('Processing chunk %d / %d ...', i, len(chunks))
         try:
-            raw_output = _call_gpt(client, chunk)
+            raw_output = _call_gpt(client, chunk, doc_profile)
             records    = _parse_json_from_output(raw_output)
             logger.info('Chunk %d: %d records extracted', i, len(records))
             all_records.extend(records)
